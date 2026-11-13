@@ -1,0 +1,404 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# gz2a — control script for the GLM-ZAI-2API bridge on Android (Termux).
+#
+# Commands:
+#   start          start the bridge in the background (with wake-lock)
+#   stop           stop the bridge (and release wake-lock)
+#   restart        restart if running, otherwise start
+#   status         process + Z.AI session + token count
+#   logs [-f]      show server logs (follow with -f)
+#   test           health check + a real 1-token test chat
+#   refresh [src]  rebuild tokens.sqlite from a token file / Downloads /
+#                  clipboard, then restart.  Sources, in order tried:
+#                    gz2a refresh /path/to/zum-tokens.txt
+#                    gz2a refresh            (newest zum-tokens*.txt in
+#                                            Downloads, else clipboard)
+#                    cat f.txt | gz2a refresh -
+#   tokens         show remaining device-token count
+#   token          print the AUTH_TOKEN clients must use
+#   settoken JWT   set ZAI_TOKEN (unlocks GLM-5 models + vision) & restart
+#   cleartoken     remove ZAI_TOKEN (back to guest mode) & restart
+#   expose on|off  bind 127.0.0.1 (off, default) or 0.0.0.0 (on, LAN/hotspot)
+#   url            client connection URLs
+#   doctor         full diagnostic
+#
+# Install location: ~/gz2a  (this script, binary, .env, tokens.sqlite)
+
+set -u
+
+GZ2A_DIR="${GZ2A_DIR:-$HOME/gz2a}"
+BIN="$GZ2A_DIR/glm-zai-2api"
+MKTOKENS="$GZ2A_DIR/mktokens"
+ENV_FILE="$GZ2A_DIR/.env"
+DB="$GZ2A_DIR/tokens.sqlite"
+LOG="$GZ2A_DIR/gz2a.log"
+PIDFILE="$GZ2A_DIR/gz2a.pid"
+
+C_G="\033[32m"; C_R="\033[31m"; C_Y="\033[33m"; C_B="\033[36m"; C_0="\033[0m"
+say()  { printf "%b\n" "$*"; }
+ok()   { printf "%b\n" "${C_G}✔${C_0} $*"; }
+bad()  { printf "%b\n" "${C_R}✘${C_0} $*" >&2; }
+info() { printf "%b\n" "${C_B}ℹ${C_0} $*"; }
+
+port()   { sed -n 's/^PORT=\([0-9]*\).*/\1/p' "$ENV_FILE" 2>/dev/null | tail -1; }
+host()   { sed -n 's/^HOST=\(.*\)$/\1/p'      "$ENV_FILE" 2>/dev/null | tail -1; }
+authtok(){ sed -n 's/^AUTH_TOKEN=\(.*\)$/\1/p' "$ENV_FILE" 2>/dev/null | tail -1; }
+PORT_="$(port)"; PORT_="${PORT_:-5082}"
+HOST_="$(host)"; HOST_="${HOST_:-127.0.0.1}"
+BASE="http://127.0.0.1:$PORT_"
+
+pid_alive() {
+  [ -f "$PIDFILE" ] || return 1
+  local p; p="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+wait_health() {  # $1 = timeout seconds
+  local i=0
+  while [ "$i" -lt "$(( ${1:-15} * 2 ))" ]; do
+    if curl -s -m 3 "$BASE/admin/health" 2>/dev/null | grep -q '"healthy":true'; then
+      return 0
+    fi
+    sleep 0.5; i=$((i+1))
+  done
+  return 1
+}
+
+cmd_start() {
+  if pid_alive; then bad "Already running (pid $(cat "$PIDFILE")). Try: gz2a restart"; exit 1; fi
+  [ -x "$BIN" ] || { bad "Binary missing: $BIN"; exit 1; }
+  # If something else still squats on our port, refuse to start a zombie.
+  if curl -s -m 2 "$BASE/admin/health" 2>/dev/null | grep -q '"healthy":true'; then
+    bad "An orphan GZ2A instance is still listening on port $PORT_."
+    info "Kill it:  pkill -f '$BIN'   (then: gz2a start)"
+    exit 1
+  fi
+  if curl -s -m 2 -o /dev/null "$BASE/" 2>/dev/null; then
+    bad "Another app is already using port $PORT_."
+    info "Edit PORT in $ENV_FILE and run 'gz2a start' again."
+    exit 1
+  fi
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1
+  # NOTE: 'exec' makes the subshell BECOME the server (via nohup), so $! is
+  # the real server pid — killing it later actually stops the server.
+  # stdin from /dev/null: the server skips its "Press Enter" pause and
+  # exits cleanly on fatal errors instead of blocking.
+  ( cd "$GZ2A_DIR" && exec nohup "$BIN" </dev/null >> "$LOG" 2>&1 ) &
+  echo $! > "$PIDFILE"
+  sleep 1
+  if ! pid_alive; then
+    bad "Process died immediately — last log lines:"
+    tail -n 15 "$LOG" 2>/dev/null >&2
+    exit 1
+  fi
+  if wait_health 25; then
+    ok "Bridge is up — $BASE  (auth token: $(authtok))"
+    info "Client base URL: $BASE/v1"
+    if [ "$(host)" = "0.0.0.0" ]; then
+      info "LAN mode: other devices can use $(lan_ip):$PORT_/v1"
+    fi
+  else
+    bad "Server did not become healthy — last log lines:"
+    tail -n 15 "$LOG" 2>/dev/null >&2
+    exit 1
+  fi
+}
+
+cmd_stop() {
+  local had=0
+  if pid_alive; then
+    had=1
+    local p="$(cat "$PIDFILE")"
+    kill "$p" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do pid_alive || break; sleep 0.5; done
+    pid_alive && kill -9 "$p" 2>/dev/null
+    rm -f "$PIDFILE"
+  else
+    rm -f "$PIDFILE" 2>/dev/null
+  fi
+  # Belt & braces: if something still answers on our port, kill by exact
+  # binary path (matches both the native binary and any wrapper).
+  if curl -s -m 2 "$BASE/admin/health" >/dev/null 2>&1; then
+    pkill -f "$BIN" 2>/dev/null
+    sleep 1
+    if curl -s -m 2 "$BASE/admin/health" >/dev/null 2>&1; then
+      bad "Something still holds port $PORT_. Investigate: gz2a logs"
+      exit 1
+    fi
+  fi
+  command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock >/dev/null 2>&1
+  if [ "$had" = 1 ]; then ok "Stopped."; else info "Was not running."; fi
+}
+
+cmd_restart() { local was=0; pid_alive && was=1; [ "$was" = 1 ] && cmd_stop; cmd_start; }
+
+cmd_status() {
+  if pid_alive; then ok "Process: running (pid $(cat "$PIDFILE"))"
+  else bad "Process: not running"; fi
+  local st; st="$(curl -s -m 5 "$BASE/status" 2>/dev/null)"
+  if [ -n "$st" ] && echo "$st" | grep -q '"connected"'; then
+    local PY="$(command -v python3 || command -v python || true)"
+    if [ -n "$PY" ]; then
+      ZAI_JSON="$st" $PY - <<'PY' 2>/dev/null || echo "  $st"
+import json, os
+d = json.loads(os.environ['ZAI_JSON'])
+print(f"  Z.AI session : connected={d['connected']}  user={d.get('userName','?')}")
+print(f"  Device tokens: {d['tokenCount']}")
+print(f"  Mode         : {d['mode']}  fe={d.get('feVersion','?')}")
+PY
+    else
+      echo "  $st"
+    fi
+  else
+    info "HTTP API not answering on $BASE"
+  fi
+  if [ -f "$ENV_FILE" ]; then
+    grep -q '^ZAI_TOKEN=..*' "$ENV_FILE" \
+      && ok "ZAI_TOKEN: set (GLM-5 models + vision unlocked)" \
+      || info "ZAI_TOKEN: not set (guest mode — glm-4.7 only)"
+  fi
+}
+
+cmd_logs() {
+  [ -f "$LOG" ] || { info "No log yet at $LOG"; exit 0; }
+  if [ "${1:-}" = "-f" ]; then tail -n 40 -f "$LOG"; else tail -n "${2:-40}" "$LOG"; fi
+}
+
+cmd_test() {
+  info "Health…"
+  if curl -s -m 5 "$BASE/admin/health" | grep -q '"healthy":true'; then ok "healthy"
+  else bad "no answer on $BASE (is it running? gz2a start)"; exit 1; fi
+  local t; t="$(authtok)"
+  info "Sending a real chat completion (burns 1 device token)…"
+  local r
+  r="$(curl -s -m 90 -X POST "$BASE/v1/chat/completions" \
+        -H "Content-Type: application/json" -H "Authorization: Bearer $t" \
+        -d '{"model":"glm-4.7","messages":[{"role":"user","content":"Reply with exactly: it works"}],"stream":false}')"
+  if echo "$r" | grep -q '"content"'; then
+    ok "Chat OK → $(echo "$r" | grep -o '"content":"[^"]*"' | head -1)"
+    ok "Everything works."
+  else
+    bad "Chat failed: $r"
+    if echo "$r" | grep -q 'x509\|certificate signed by unknown'; then
+      info "That's the old Android TLS bug — your binary predates certfix1."
+      info "Update: re-run install.sh from the new gz2a-android package, then 'gz2a restart'."
+    elif echo "$r" | grep -q '\[::1\]:53'; then
+      info "That's the old Android DNS bug — your binary predates dnsfix1."
+      info "Update: re-run install.sh from the new gz2a-android package, then 'gz2a restart'."
+    else
+      info "If it says 'captcha verification failed' → device tokens are stale/empty: refresh them (see README §4)."
+    fi
+    exit 1
+  fi
+}
+
+cmd_tokens() {
+  local n=0
+  local PY="$(command -v python3 || command -v python || true)"
+  if [ -f "$DB" ] && [ -n "$PY" ]; then
+    n="$($PY -c "import sqlite3;print(sqlite3.connect('$DB').execute('SELECT COUNT(*) FROM tokens').fetchone()[0])" 2>/dev/null || echo '?')"
+  elif [ -f "$DB" ]; then
+    n="$(curl -s -m 5 "$BASE/status" | grep -o '"tokenCount":[0-9]*' | grep -o '[0-9]*')"
+  fi
+  say "Device tokens left: ${n:-unknown}"
+  [ "${n:-0}" = "0" ] && info "None left → run: gz2a refresh   (see README for the 60-second browser step)"
+  return 0
+}
+
+cmd_token() { say "AUTH_TOKEN: $(authtok)"; info "Use it as the API key in client apps."; }
+
+set_env_key() {  # $1 key  $2 value
+  touch "$ENV_FILE"
+  if grep -q "^$1=" "$ENV_FILE"; then
+    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  else
+    echo "$1=$2" >> "$ENV_FILE"
+  fi
+}
+
+cmd_settoken() {
+  [ $# = 1 ] || { bad "Usage: gz2a settoken eyJhbGciOi..."; exit 1; }
+  case "$1" in eyJ*) ;; *) bad "That does not look like a Z.AI JWT (must start with 'eyJ')"; exit 1;; esac
+  set_env_key ZAI_TOKEN "$1"
+  ok "ZAI_TOKEN saved."
+  pid_alive && cmd_restart || true
+  info "Verify with: gz2a test"
+}
+
+cmd_cleartoken() {
+  sed -i '/^ZAI_TOKEN=/d' "$ENV_FILE"
+  ok "ZAI_TOKEN removed (guest mode)."
+  pid_alive && cmd_restart || true
+}
+
+cmd_expose() {
+  case "${1:-}" in
+    on)  set_env_key HOST 0.0.0.0;  ok "Binding to 0.0.0.0 — reachable from your LAN/hotspot";;
+    off) set_env_key HOST 127.0.0.1; ok "Binding to 127.0.0.1 — phone only";;
+    *)   bad "Usage: gz2a expose on|off"; exit 1;;
+  esac
+  pid_alive && cmd_restart || true
+  [ "${1:-}" = on ] && info "Other devices → http://$(lan_ip):$PORT_/v1 (API key: $(authtok))"
+  return 0
+}
+
+lan_ip() {
+  ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1 \
+    || ifconfig 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1 \
+    || echo "phone-ip"
+}
+
+cmd_url() {
+  local t; t="$(authtok)"
+  say "On this phone:   base URL ${C_B}http://127.0.0.1:$PORT_/v1${C_0}   API key ${C_B}$t${C_0}"
+  if [ "$(host)" = "0.0.0.0" ]; then
+    say "Other devices:   base URL ${C_B}http://$(lan_ip):$PORT_/v1${C_0}   API key ${C_B}$t${C_0}"
+  else
+    info "LAN mode is off — 'gz2a expose on' to serve other devices"
+  fi
+  say "Dashboard:       ${C_B}http://127.0.0.1:$PORT_${C_0}"
+}
+
+find_latest_downloads() {
+  local d
+  for d in "$HOME/storage/downloads" "/sdcard/Download" "/storage/emulated/0/Download"; do
+    [ -d "$d" ] || continue
+    ls -t "$d"/zum-tokens*.txt 2>/dev/null | head -1 && return 0
+  done
+  return 1
+}
+
+cmd_refresh() {
+  [ -x "$MKTOKENS" ] || { bad "mktokens helper missing: $MKTOKENS"; exit 1; }
+  local src="${1:-}"
+  # NOTE: 'tmp' is intentionally GLOBAL — the EXIT trap below fires after
+  # this function returned, when locals are already gone (set -u would abort).
+  tmp="$(mktemp "$GZ2A_DIR/.tokens-XXXXXX.txt")"
+  trap 'rm -f "$tmp"' EXIT
+
+  if [ "$src" = "-" ]; then
+    cat > "$tmp"; src="$tmp"
+  elif [ -n "$src" ] && [ ! -f "$src" ]; then
+    bad "File not found: $src"; exit 1
+  elif [ -z "$src" ]; then
+    src="$(find_latest_downloads)" || true
+    if [ -z "$src" ]; then
+      if command -v termux-clipboard-get >/dev/null 2>&1; then
+        info "No zum-tokens*.txt in Downloads — trying clipboard…"
+        termux-clipboard-get > "$tmp" 2>/dev/null; src="$tmp"
+      fi
+    else
+      ok "Using newest file: $src"
+    fi
+  fi
+  [ -n "$src" ] && [ -f "$src" ] || {
+    bad "No token source found."
+    info "Collect tokens first (README § Refresh): open chat.z.ai in a browser, run the"
+    info "userscript/bookmarklet, then re-run 'gz2a refresh'. Or: gz2a refresh <file>"
+    exit 1
+  }
+
+  # Sanity: every line must look like a base64 z_um token
+  if ! grep -qE '^[A-Za-z0-9+/=]{40,}$' "$src"; then
+    bad "That file doesn't look like a token list (need one base64 token per line)."
+    exit 1
+  fi
+
+  local was=0; pid_alive && was=1
+  [ "$was" = 1 ] && cmd_stop
+  if "$MKTOKENS" -out "$DB" "$src"; then
+    ok "tokens.sqlite rebuilt."
+  else
+    bad "Rebuild failed — keeping the old DB."
+    [ "$was" = 1 ] && cmd_start
+    exit 1
+  fi
+  [ "$was" = 1 ] && cmd_start
+  cmd_tokens
+  info "Burned/old tokens are gone. Run 'gz2a test' to confirm."
+}
+
+cmd_doctor() {
+  local issues=0
+  say "${C_B}── GZ2A doctor ──${C_0}"
+  # Termux?
+  if [ -n "${TERMUX_VERSION:-}" ] || case "${PREFIX:-}" in /data/data/com.termux*) true;; *) false;; esac; then
+    ok "Termux: yes (${TERMUX_VERSION:-detected})"
+  else
+    info "Termux: no (running outside Termux — some features unavailable)"; fi
+  # arch
+  case "$(uname -m)" in
+    aarch64|arm64) ok "CPU: arm64 — binary matches";;
+    armv7l|armv8l) bad "CPU: 32-bit ARM — this build is 64-bit only"; issues=1;;
+    *) info "CPU: $(uname -m) (fine if you run the matching binary)";;
+  esac
+  # files
+  [ -x "$BIN" ] && ok "Server binary: present" || { bad "Server binary missing: $BIN"; issues=1; }
+  [ -x "$MKTOKENS" ] && ok "mktokens: present" || { bad "mktokens missing: $MKTOKENS"; issues=1; }
+  [ -f "$ENV_FILE" ] && ok ".env: present" || { bad ".env missing: $ENV_FILE"; issues=1; }
+  # can execute? (126/127 = kernel refused — wrong arch or missing loader)
+  if [ -x "$BIN" ]; then
+    "$BIN" --help >/dev/null 2>&1; rc=$?
+    if [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then ok "Binary executes"
+    else bad "Binary will not execute (wrong architecture?)"; issues=1; fi
+  fi
+  # tokens
+  cmd_tokens
+  # server
+  if pid_alive; then
+    ok "Server: running"
+    if curl -s -m 5 "$BASE/admin/health" | grep -q healthy; then ok "HTTP: healthy on $BASE"
+    else bad "HTTP: not answering"; issues=1; fi
+  else
+    info "Server: not running (start with: gz2a start)"
+  fi
+  # Z.AI reachability (curl uses Termux's own CA store, so this also proves
+  # the network path; the bridge's trust store is checked via the [CA] log)
+  if curl -s -m 8 -o /dev/null -w '%{http_code}' https://chat.z.ai 2>/dev/null | grep -qE '20|30|40'; then
+    ok "Network: chat.z.ai reachable"
+  else
+    bad "Network: chat.z.ai NOT reachable (check Wi-Fi/data or DNS)"; issues=1
+  fi
+  # binary version / DNS + CA mode (dnsfix1/certfix1 builds log it at startup)
+  if grep -q 'certfix1' "$LOG" 2>/dev/null; then
+    ok "Binary: v1.1.1-certfix1 (Android DNS + root-CA fixes present)"
+  elif grep -q 'dnsfix1' "$LOG" 2>/dev/null; then
+    info "Binary: v1.1.0-dnsfix1 (DNS fixed; TLS fix missing — update the package!)"
+  elif [ -f "$LOG" ]; then
+    info "Binary: pre-dnsfix (update the package if [::1]:53 DNS or x509 errors appear)"
+  fi
+  local dl; dl="$(grep '\[DNS\]' "$LOG" 2>/dev/null | tail -1 | sed 's/^[0-9/: ]*\[DNS\] //')"
+  [ -n "$dl" ] && info "DNS mode: $dl"
+  local cl; cl="$(grep '\[CA\]' "$LOG" 2>/dev/null | tail -1 | sed 's/^[0-9/: ]*\[CA\] //')"
+  [ -n "$cl" ] && info "CA mode : $cl"
+  # storage for refresh
+  [ -d "$HOME/storage/downloads" ] && ok "Storage: Downloads linked (refresh-from-file ready)" \
+    || info "Storage: run 'termux-setup-storage' once to enable refresh-from-file"
+  if command -v termux-wake-lock >/dev/null 2>&1; then ok "termux-tools: available (wake-lock supported)"
+  else info "termux-tools: not found"; fi
+  [ "$issues" = 0 ] && say "${C_G}All checks that matter passed.${C_0}" \
+    || say "${C_Y}Issues found — fix the ✘ lines above.${C_0}"
+}
+
+help() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-help}" in
+  start)    shift; cmd_start "$@";;
+  stop)     shift; cmd_stop "$@";;
+  restart)  shift; cmd_restart "$@";;
+  status)   shift; cmd_status "$@";;
+  logs)     shift; cmd_logs "$@";;
+  test)     shift; cmd_test "$@";;
+  tokens)   shift; cmd_tokens "$@";;
+  refresh)  shift; cmd_refresh "$@";;
+  token)    shift; cmd_token "$@";;
+  settoken) shift; cmd_settoken "$@";;
+  cleartoken) shift; cmd_cleartoken "$@";;
+  expose)   shift; cmd_expose "$@";;
+  url)      shift; cmd_url "$@";;
+  doctor)   shift; cmd_doctor "$@";;
+  help|-h|--help) help;;
+  *) bad "Unknown command: $1"; help; exit 1;;
+esac

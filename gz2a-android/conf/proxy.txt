@@ -1,0 +1,11 @@
+# GZ2A proxy pool — used only when USE_PROXY=true in .env
+# One proxy per line. Chat goes DIRECT first; after an Aliyun WAF block
+# (HTTP 405) retries rotate through this list.
+#
+# Supported formats:
+#   http://123.45.67.89:8080
+#   http://user:pass@123.45.67.89:8080
+#   socks5://123.45.67.89:1080
+#
+# Leave empty if you never hit a WAF block. Do NOT use proxies you do not
+# trust: they see your traffic to Z.AI.

@@ -1,0 +1,39 @@
+GZ2A bookmarklet — collect device tokens on chat.z.ai with ANY browser
+(no extension needed; works in vanilla Chrome on Android).
+
+────────────────────────────────────────────────────────────────────────
+HOW TO INSTALL (one time)
+────────────────────────────────────────────────────────────────────────
+1. Open Chrome on your phone, go to any page (e.g. chat.z.ai).
+2. Menu (⋮) → ☆ Star / Add to bookmarks.
+3. Edit the bookmark:
+     Name:  Collect GZ2A tokens
+     URL:   paste the javascript: line below (ALL of it, one line)
+4. Save.
+
+────────────────────────────────────────────────────────────────────────
+HOW TO USE
+────────────────────────────────────────────────────────────────────────
+1. Open https://chat.z.ai and send any message (e.g. "hi") in the chat.
+   (The z_um SDK loads after the first send.)
+2. Tap the address bar and type:  Collect GZ2A
+   → tap the bookmark when it appears.
+3. Wait ~10–30 s. You get an alert with the count. The tokens are:
+     • saved to Downloads as zum-tokens-<date>.txt
+     • copied to the clipboard
+4. In Termux:   gz2a refresh
+   (picks the newest zum-tokens*.txt from Downloads automatically)
+
+────────────────────────────────────────────────────────────────────────
+THE BOOKMARKLET (copy this whole line as the bookmark URL)
+────────────────────────────────────────────────────────────────────────
+
+javascript:(async()=>{try{if(typeof window.z_um==='undefined'||typeof window.z_um.getToken!=='function'){alert('Send any message in the chat first, then run this again.');return}const N=100,out=[],seen=Object.create(null);for(let i=0;i<N;i++){let t=window.z_um.getToken();if(t&&typeof t.then==='function')t=await t;if(t&&!seen[t]){seen[t]=1;out.push(t)}if(i%50===0)await new Promise(r=>setTimeout(r,0))}if(!out.length){alert('No tokens collected');return}const text=out.join('\n');const stamp=new Date().toISOString().slice(0,16).replace(/[:T-]/g,'');const name='zum-tokens-'+stamp+'.txt';try{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));a.download=name;document.body.appendChild(a);a.click();a.remove()}catch(e){}try{await navigator.clipboard.writeText(text)}catch(e){}alert('Collected '+out.length+' tokens.\nSaved to Downloads as '+name+' and copied to clipboard.\nNow run: gz2a refresh')}catch(e){alert('Error: '+e)}})()
+
+────────────────────────────────────────────────────────────────────────
+NOTES
+• Prefer the userscript (gz2a-token-collector.user.js) if you use Kiwi /
+  Lemur browser + Tampermonkey: it has a button, auto-triggers the SDK,
+  shows progress, and can also copy your Z.AI login token.
+• Tokens are single-use and expire — collect a fresh batch right before
+  'gz2a refresh' when chats start failing with captcha errors.
